@@ -1,2 +1,2 @@
-# MMPP
-markov modulated poisson process for detecting events
+# Multivariate hidden markov chains
+We employed a multivariate Hidden Markov Model (HMM) to identify and predict future events. To evaluate its performance, we compared three different parameterizations: the Cartesian Product model, Conditional Independence, and Contemporaneous Independence, using simulated data. For the Cartesian Product model, we applied a traditional Forward-Backward algorithm by aggregating all states. We utilized a novel individual forward-backward algorithm for the Conditional Independence and Contemporaneous Independence settings.
