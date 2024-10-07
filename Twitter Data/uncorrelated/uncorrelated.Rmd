@@ -1,0 +1,1539 @@
+---
+title: "twitter"
+output: html_document
+---
+
+```{r}
+library(Formula)
+library(DirichletReg)
+library(MASS)
+library(mvtnorm)
+library(pROC)
+library(pgdraw)
+```
+
+
+
+```{r}
+appendi <- function(vec1 , i, place){
+  # this insert a number i to the vec at a specific place
+  if (place == 1){
+    return(c(i, vec1))
+  }else if (place == length(vec1)+1){ 
+    return(c(vec1, i))
+  }else{
+    return(c(vec1[1:(place-1)], i, vec1[place:length(vec1)]))
+  }
+}
+```
+
+
+
+so what is eta? eta is the parameter that takes the value of all the states of the previous time returns the distribution probability of one target state.
+
+eta better to be a big transition matrix 2^n times 2n dim
+two auxiliary functions to find row and column of eta
+
+
+
+```{r}
+# Forward Backward Algorithm
+iFBalgorithm <- function(states, chaini, x, z_i, px_given_z, para, eta, c, length_int){
+  
+  # states: possible states of the Markov Chain
+  # chaini: the target chain that we would like to find the full conditional of that
+  # x: observed data for chaini
+  # z_i: the states for the rest of the chains except for the target
+  # px_given_z: emission probability p(x|z)
+  # para: time dependent lambda for i^th chain i.e. lambda(t) (for one period)
+  # eta: instead of joint transition matrix, we have etas for the individual fb algorithm (2^n * 2n)
+  # c: shifting constant
+  # length_int: length of interval for each observation
+  
+  
+  # difference between states and 1
+  gap = 1-states[1]
+  
+  # number of states
+  m = length(states)
+  
+  # length of the Markov Chain
+  n = length(x)
+  
+  # dimension of the chain:
+  if (is.null(dim(z_i))){
+    ndim = 2
+    z_i <- matrix(data = z_i, nrow = 1)
+  }else{
+    ndim = dim(z_i)[1]+1
+  }
+  
+  
+  # index for the rest of the chain
+  order1 <- (1:ndim)[-chaini]
+  
+  # define functions f1, f2 to extract columns and rows of eta
+  # in default, we assume that all the chains has the same state space
+  
+  # for columns
+  f1 <- function(columni){
+    # it takes a column and returns which column does 
+    n1 <- length(columni)
+    s1 <- sum(sapply(1:n1, function(nn){m^(nn-1)*columni[n1+1-nn]
+      }))
+    
+    # here we assume m not equal to 1
+    s2 <- m*(1-m^(n1-1))/(1-m)
+    
+    return(s1-s2)
+  }
+  
+  # for rows
+  f2 <- function(which_chain, state_chain){
+    
+    # it takes the order of chain and the state
+    return(m*(which_chain-1)+state_chain)
+  }
+  
+  # Forward
+  
+  # Initialize alpha
+  alpha = matrix(data = NA, nrow = m, ncol = n)
+  
+  # p(z1, x1, rest of z)
+  # assume that pi(z_1^c is uniform)
+  
+  # alpha1 \propto \pi(z)p(x_1|z_1,\theta)\prod(eta)
+  alpha[,1] =  rep(1,m) * px_given_z(x[1], states, para, 1, c, length_int) * sapply(1:m, function(state1){
+    state.cur <- appendi(z_i[,1], state1, chaini)
+    prod(eta[f1(state.cur), f2(order1,z_i[,2])])
+  })  
+  
+  # normalize
+  alpha[,1] = alpha[,1]/sum(alpha[,1])
+  
+  # Iteration
+  for (i in 2:n){
+    for (zk in states){
+      
+      # order in a period
+      len_period = n/num_periods
+      n_period = ifelse(i%%(len_period) == 0, (len_period), i%%(len_period))
+      
+      alpha[zk+gap,i] = 
+        sum(unlist(sapply(states, 
+          function(zk_1){
+            state.pre <- appendi(z_i[,(i-1)], zk_1, chaini)
+            prob1 <- eta[f1(state.pre), f2(chaini,zk)] * px_given_z(x[i], zk, para, n_period, c, length_int) * alpha[zk_1+gap,i-1]
+            if (i == n){
+              return(prob1)
+            }else{
+              state.cur <- appendi(z_i[,i], zk, chaini)
+              eta_row <- f1(state.cur)
+              eta_col <- f2(order1,z_i[,(i+1)])
+              return(prob1 * prod(eta[eta_row, eta_col]))
+            }
+          })))
+    }
+    
+    # normalize 
+    alpha[,i] = alpha[,i]/sum(alpha[,i])
+    
+  }
+  
+  
+  # Backward
+  
+  # Initial condition
+  beta = matrix(data = NA, nrow = m, ncol = n)
+  
+  beta[,n] = 1
+  
+  # Iteration
+  for (i in (n-1):1){
+    for (zk in states){
+    
+      # order in a period
+      len_period = n/num_periods
+      n_period = ifelse((i+1)%%(len_period) == 0, (len_period), (i+1)%%(len_period))
+      
+      beta[zk+gap,i] = 
+        sum(unlist(sapply(states, 
+          function(zk_1){
+            state.pre <- appendi(z_i[,i], zk, chaini)
+            prob1 <- eta[f1(state.pre), f2(chaini,zk_1)] * px_given_z(x[i+1], zk_1, para, n_period, c, length_int) * beta[zk_1+gap,i+1]
+            if (i == (n-1)){
+              return(prob1)
+            }else{
+              state.cur <- appendi(z_i[,(i+1)], zk_1, chaini)
+              eta_row <- f1(state.cur)
+              eta_col <- f2(order1,z_i[,(i+2)])
+              return(prob1 * prod(eta[eta_row, eta_col]))
+            }
+          })))
+    }
+    
+    # normalize (can be done later)
+    beta[,i] = beta[,i]/sum(beta[,i])
+    
+  }
+  
+  # combine the result from forward and backward
+  post_z = sapply(1:n,function(i){
+    alpha[,i]*beta[,i]/sum(alpha[,i]*beta[,i])   # normalize
+  })
+
+  return(list(alpha, beta, post_z))
+}
+
+```
+
+
+
+```{r}
+# sample the markov chain
+
+sample_z <- function(states, chaini, x, z_i, alpha, beta, post_z, px_given_z, para, eta, c, length_int){
+  # states: possible states of the Markov Chain
+  # chaini: the target chain that we would like to find the full conditional of that
+  # x: observed data for chaini
+  # z_i: the states for the rest of the chains except for the target
+  # alpha: result from the forward algorithm p(zj, x1:j)
+  # beta: result from the backward algorithm p(xj+1:n| zj)
+  # post_z: reulst from forward-backward algorithm p(zj|x)
+  # px_given_z: emission probabiltiy p(x|z)
+  # para: time dependent lambda i.e. lambda(t)
+  # para: time dependent lambda for i^th chain i.e. lambda(t) (for one period)
+# eta: instead of joint transition matrix, we have etas for the individual fb algorithm (2^n * 2n)
+  # c: shifting constant
+  # length_int: length of interval for each observation
+  
+  # number of states
+  m = length(states)
+  
+  # length of the Markov Chain
+  n = length(x)
+  
+  # dimension of the chain:
+  if (is.null(dim(z_i))){
+    ndim = 2
+    z_i <- matrix(data = z_i, nrow = 1)
+  }else{
+    ndim = dim(z_i)[1]+1
+  }
+  
+  
+  # index for the rest of the chain
+  order1 <- (1:ndim)[-chaini]
+  
+  # define functions f1, f2 to extract columns and rows of eta
+  # in default, we assume that all the chains has the same state space
+  
+  # for columns
+  f1 <- function(columni){
+    # it takes a column and returns which column does 
+    n1 <- length(columni)
+    s1 <- sum(sapply(1:n1, function(nn){m^(nn-1)*columni[n1+1-nn]
+      }))
+    
+    # here we assume m not equal to 1
+    s2 <- m*(1-m^(n1-1))/(1-m)
+    
+    return(s1-s2)
+  }
+  
+  # for rows
+  f2 <- function(which_chain, state_chain){
+    
+    # it takes the order of chain and the state
+    return(m*(which_chain-1)+state_chain)
+  }
+  
+  # initialize
+  z_sample = rep(NA,n)
+  
+  # dimension of the chain:
+  if (is.null(dim(z_i))){
+    ndim = 2
+    z_i <- matrix(data = z_i, nrow = 1)
+  }else{
+    ndim = dim(z_i)[1]+1
+  }
+  
+  # we can get p(z1| x) directly from the fb algorithm
+  prob_1 = alpha[,1]*beta[,1]
+  
+  prob_2 = sapply(1:m, function(state1){
+    state.cur <- appendi(z_i[,1], state1, chaini)
+    prod(eta[f1(state.cur), f2(order1,z_i[,2])])
+  })  
+  
+  prob_3 <- prob_1*prob_2/sum(prob_1*prob_2)
+  
+  # sample the first term
+  z_sample[1] = sample(states, 1, prob = prob_3)
+  
+  # difference between states and 1
+  gap = 1-states[1]
+  
+  # number of states
+  m = length(states)
+  
+  # length of the Markov Chain
+  n = length(x)
+  
+  # index for the rest of the chain
+  order1 <- (1:ndim)[-chaini]
+  
+  # for j = 2, ..., n-1
+  for (j in 2:n){
+    
+    # order in a period
+    len_period = n/num_periods
+    n_period = ifelse(j%%(len_period) == 0, (len_period), j%%(len_period))
+    
+    # p1 = p(zj-1, x1:j-1) * p(zj|zj-1)
+    state.pre <- appendi(z_i[,(j-1)], z_sample[j-1], chaini)
+    p1 = alpha[,j-1] * eta[f1(state.pre), f2(chaini ,states)]
+    
+    # p2 = p(xj|zj) * p(xj+1:n|zj)
+    p2 = px_given_z(x[j], states, para, n_period, c, length_int) * beta[, j]
+    
+    if (j == n){
+      prob = (p1*p2)/sum(p1*p2)
+    }else{
+      p3 = sapply(1:m, function(state1){
+    state.cur <- appendi(z_i[,j], state1, chaini)
+    prod(eta[f1(state.cur), f2(order1, z_i[,j+1])])
+      })
+      prob = (p1*p2*p3)/sum(p1*p2*p3)
+    }
+    
+    # sample zj
+    z_sample[j] = sample(states, 1, prob = prob)
+  }
+  return(z_sample)
+}
+
+```
+
+
+
+```{r}
+# Viterbi Algorithm
+# find the most likely path for a given chain
+Viterbi <- function(states, chaini, x, z_i, px_given_z, para, eta, c, length_int){
+  # states: possible states of the Markov Chain
+  # chaini: the target chain that we would like to find the full conditional of that
+  # x: observed data for chaini
+  # z_i: the states for the rest of the chains except for the target
+  # px_given_z: emission probabiltiy p(x|z)
+  # para: time dependent lambda i.e. lambda(t)
+  # eta: instead of joint transition matrix, we have etas for the individual fb algorithm (2^n * 2n)
+  # c: shifting constant
+  # length_int: length of interval for each observation
+  
+ # difference between states and 1
+  gap = 1-states[1]
+  
+  # number of states
+  m = length(states)
+  
+  # length of the Markov Chain
+  n = length(x)
+  
+  # dimension of the chain:
+  if (is.null(dim(z_i))){
+    ndim = 2
+    z_i <- matrix(data = z_i, nrow = 1)
+  }else{
+    ndim = dim(z_i)[1]+1
+  }
+  
+  
+  # index for the rest of the chain
+  order1 <- (1:ndim)[-chaini]
+  
+  # define functions f1, f2 to extract columns and rows of eta
+  # in default, we assume that all the chains has the same state space
+  
+  # for columns
+  f1 <- function(columni){
+    # it takes a column and returns which column does 
+    n1 <- length(columni)
+    s1 <- sum(sapply(1:n1, function(nn){m^(nn-1)*columni[n1+1-nn]
+      }))
+    
+    # here we assume m not equal to 1
+    s2 <- m*(1-m^(n1-1))/(1-m)
+    
+    return(s1-s2)
+  }
+  
+  # for rows
+  f2 <- function(which_chain, state_chain){
+    
+    # it takes the order of chain and the state
+    return(m*(which_chain-1)+state_chain)
+  }
+  
+  # initialize mu and zstar
+  # mu[m0, n0] means the optimal path ends at z_n0 = m0
+  # mu = max log(p(z,x))
+  # zstar is the corresponding optimial path
+  
+  mu = matrix(data = NA, nrow = m, ncol = n)
+  zstar = matrix(data = NA, nrow = m, ncol = n)
+  
+  # initial condition
+  # assume pi(z_1) is uniform
+  mu[,1] = rep(1,m) * px_given_z(x[1], states, para, 1, c, length_int) * sapply(1:m, function(state1){
+    state.cur <- appendi(z_i[,1], state1, chaini)
+    prod(eta[f1(state.cur), f2(order1,z_i[,2])])
+  })  
+  
+  zstar[,1] = states
+  
+  
+  # recursion
+  for (i in 2:n){ # for each time
+    for (j in 1:m){ # for each state
+      
+      # order in a period
+      len_period = n/num_periods
+      n_period = ifelse(i%%(len_period) == 0, (len_period), i%%(len_period))
+      
+      
+      
+      
+      mu_all1 = log(px_given_z(x[i], states[j], para, n_period, c, length_int)) + mu[,i-1]
+      
+      mu_all2 = sapply(states, function(zk_1){
+        state.pre <- appendi(z_i[,(i-1)], zk_1, chaini)
+        prob1 <- log(eta[f1(state.pre), f2(chaini,j)])
+        if (i == n){
+          return(prob1)
+        }else{
+          state.cur <- appendi(z_i[,i], j, chaini)
+          eta_row <- f1(state.cur)
+          eta_col <- f2(order1,z_i[,(i+1)])
+          return(prob1 + sum(log(eta[eta_row, eta_col])))
+        }
+      })
+
+      mu_all = mu_all1 + mu_all2
+      # mu_k(zk) = max[ logp(xk|zk) + logp(zk|zk-1) + mu_k-1(zk-1)  ]
+      mu[j,i] = max(mu_all)
+      
+      # the state zk_1 maximize the path
+      state_before = which.max(mu_all)-gap
+      
+      # update the path
+      zstar[j,1:i] = c(zstar[state_before+gap, 1:(i-1)], states[j])
+    }
+    
+  }
+  
+  # take max on mu to get the final result
+  last_state = states[which.max(mu[,n])]
+  return(list(zstar[last_state+gap,], max(mu[,n])))
+  
+}
+
+```
+
+
+
+```{r}
+# confusion matrix
+# generate confusion matrix from two vectors
+
+confusion_matrix <- function(a, b){
+  # inputs two vectors and generate the confusion matrix of them
+  # a is the predicted one 
+  # b is the truth 
+  ua <- sort(unique(a))
+  ub <- sort(unique(b))
+  
+  result <- matrix(data = 0, ncol = length(unique(a)), nrow = length(unique(b)), dimnames = list(ub,ua))
+  
+  
+  for (i in 1:length(a)){
+    row1 <- which( ub == b[i])
+    col1 <- which( ua == a[i])
+    result[row1, col1] <- result[row1, col1]+1
+  }
+  return(result)
+  
+}
+
+```
+
+
+
+```{r}
+# this function computes p(x|z)
+px_given_z <- function(xk, zk, para, k, c, length_int){
+  # k: ordinal of x
+  # xk: column vector 
+  # zk: hidden states with same length as xk
+  # para: (list) discretized version of continuous function (has the same dimension as x)
+  # c: shifting constant 
+  
+  return(dpois(xk, para[k] + (zk-1)*c*length_int))
+}
+
+
+```
+
+
+```{r}
+check_state <- function(zz, states_com){
+  # check the state in Mz
+  n_dim <- length(zz)
+  state1 <- sapply(1:dim(states_com)[1], function(kk){states_com[kk,]-zz})
+  state11 <- matrix(data = state1, nrow = n_dim)
+  return(which(colSums(abs(state11)) == 0))
+}
+```
+
+
+
+```{r} 
+
+log_prob <- function(z, x, px_given_z, para, eta, states_com, c, length_int){
+  
+  # length of the chain
+  n <- dim(x)[2]
+  
+  # dimension of chain
+  n_dim <- dim(x)[1]
+  
+  p1_store <- rep(NA,n)
+    
+  # p (x_i|z_i)
+  for (i in 1:n){
+    
+    # order in a period
+    len_period = n/num_periods
+    n_period = ifelse(i%%(len_period) == 0, (len_period), i%%(len_period))
+    
+    
+    p1_store[i] <- sum(sapply(1:n_dim, function(ndim){
+      log(px_given_z(x[ndim,i], z[ndim,i], para[[ndim]], n_period, c[ndim], length_int))
+    }))
+  }
+  
+  # p(z_i+1|z_i)
+  p2 = sum(sapply(1:(dim(z)[2]-1), function(j){
+    log(prod(eta[check_state(z[,j], states_com), c(0,cumsum(states[-length(states)]))+z[,(j+1)]]))
+  }))
+  
+  # pi(z1) # we set it to be uniform
+  p3 = log(1/dim(states_com)[1])
+  
+           
+  return(sum(p1_store)+p2+p3)
+}
+
+
+```
+
+
+```{r}
+sigmoid <- function(x){
+  return(1/(1+exp(-x)))
+}
+```
+
+
+```{r}
+beta_to_eta <- function(beta){
+  # beta is 2*4 matrix rbind(beta1, beta2)
+  # return the corresponding eta that is 4*4
+  
+  
+  sub_beta_to_eta <- function(beta){
+    bbeta <- c(beta[1], beta[1]+beta[3], beta[1]+beta[2], sum(beta))
+    return(sigmoid(bbeta))
+  }
+  
+  list_sub_eta <- sapply(1:2, function(aa){sub_beta_to_eta(beta[aa,])})
+  
+
+  eta_full <- cbind(1 - list_sub_eta[,1], list_sub_eta[,1], 1 - list_sub_eta[,2], list_sub_eta[,2])
+    
+  return(eta_full)
+}
+
+```
+
+
+```{r}
+# real data data
+xs <- readRDS('southLondon1.RData')
+xn <- readRDS('northLondon1.RData')
+```
+
+
+
+```{r}
+# for south london data
+
+# merge date and time into a single object
+datetime <- rep(NA, dim(xs)[1])
+for (i in 1:dim(xs)[1]){
+  datetime[i] <- format(as.POSIXlt(paste(xs$date[i], xs$time[i])), '20%y-%m-%d %H:%M:%S')
+}
+xs$datetime <- datetime
+
+# add the date time without delayed twits
+df1.xs <- data.frame(datetime =format(seq(as.POSIXct(datetime[1]), as.POSIXct( datetime[length(datetime)]),  by='15 min'), '20%y-%m-%d %H:%M:%S'))
+
+# merge two tables
+df2.xs <- merge(df1.xs, xs, by = 'datetime', all = TRUE)
+
+# add 0 to time periods without delayed twitter
+df2.xs$results[is.na(df2.xs$results)] <- 0
+
+# we only consider complete days
+df3.xs <- df2.xs[28:33053,]
+
+
+# extract data for Wednesday
+# *5 Tuesday
+# *6 Wednesday
+# *7 Thursday
+wed <- c(as.vector(sapply(0:8,function(i){i*7*96+96*5+(1:96)})),
+         as.vector(sapply(9:38,function(i){i*7*96+96*5+(1:96)-4})),
+         as.vector(sapply(39:44,function(i){i*7*96+96*5+(1:96)+2})))
+df_wed.xs = df3.xs[wed,]
+
+
+# length of data
+n = dim(df_wed.xs)[1]
+xs.new = df_wed.xs$results
+
+# number of periods
+num_periods = 45
+
+plot(xs.new, type = 'l')
+```
+
+
+
+```{r}
+# for north london data
+
+# merge date and time into a single object
+datetime <- rep(NA, dim(xn)[1])
+for (i in 1:dim(xn)[1]){
+  datetime[i] <- format(as.POSIXlt(paste(xn$date[i], xn$time[i])), '20%y-%m-%d %H:%M:%S')
+}
+xn$datetime <- datetime
+
+# add the date time without delayed twits
+df1.xn <- data.frame(datetime =format(seq(as.POSIXct(datetime[1]), as.POSIXct( datetime[length(datetime)]),  by='15 min'), '20%y-%m-%d %H:%M:%S'))
+
+# merge two tables
+df2.xn <- merge(df1.xn, xn, by = 'datetime', all = TRUE)
+
+# add 0 to time periods without delayed twitter
+df2.xn$results[is.na(df2.xn$results)] <- 0
+
+# we only consider complete days
+df3.xn <- df2.xn[28:33053,]
+
+
+# extract data for Wednesday
+# *5 Tuesday
+# *6 Wednesday
+# *7 Thursday
+wed <- c(as.vector(sapply(0:8,function(i){i*7*96+96*5+(1:96)})),
+         as.vector(sapply(9:38,function(i){i*7*96+96*5+(1:96)-4})),
+         as.vector(sapply(39:44,function(i){i*7*96+96*5+(1:96)+2})))
+df_wed.xn = df3.xn[wed,]
+
+
+# length of data
+n = dim(df_wed.xn)[1]
+xn.new = df_wed.xn$results
+
+# number of periods
+num_periods = 45
+
+plot(xn.new, type = 'l')
+```
+
+
+
+
+
+
+
+```{r}
+# delete first 6 hours (almost 0 and contains no information as railway in UK does not operated at that time)
+
+x1 <- as.vector(matrix(xn.new, ncol = num_periods)[25:96,])
+plot(seq(0, 18*num_periods-0.25, by = 0.25), x1, type = 'l', col = 'red', lty = 1, ylim = c(0,150), main = 'Delayed Tweets for North/South Railway Companies')
+
+legend('topright', c('north', 'south'), col = c('red','blue'), lwd = 2, lty = c(1,3))
+
+x2 <- as.vector(matrix(xs.new, ncol = num_periods)[25:96,])
+lines(seq(0, 18*num_periods-0.25, by = 0.25), x2, type = 'l', col = 'blue', lty = 3)
+
+```
+
+
+
+
+```{r}
+
+# hidden bivariate variable z in (1,2)^2
+states = c(2,2)
+n_dim <- length(states)
+
+# Length of the chain
+n = 72*num_periods
+
+# number of states
+states_com <- matrix(data = NA, nrow = prod(states), ncol = n_dim)
+
+for (i in 1:prod(states)){
+  ii = i
+  for (j in 1:n_dim){
+    states_com[i,j] = ceiling(ii/prod(states[-(1:j)]))
+    ii = ifelse(ii%%prod(states[-(1:j)])==0, prod(states[-(1:j)]), ii%%prod(states[-(1:j)]))
+  }
+}
+  
+
+
+```
+
+
+
+```{r}
+squaredloss1 <- function(pm){
+  c1 <- pm[1]
+  c2 <- pm[2]
+  c3 <- pm[3]
+  sigma1 <- pm[4]
+  sigma2 <- pm[5]
+  mu1 <- pm[6]
+  mu2 <- pm[7]
+  lambda <- rep(sapply(seq(6.25, 24, 0.25), function(t){
+    # expression for lambda t
+     c1*exp(-0.5*(t-mu1)^2/sigma1^2) +  c2*exp(-0.5*(t-mu2)^2/sigma2^2) + c3 }),17)
+  return(sum(dpois(x1,lambda,log=TRUE)))
+}
+
+aaa <- optim(par = c(60,35,10,0.8,1,9,18), upper = c(100,60,30,3,3,12,21), lower = c(5,5,0.1,0.1,0.1,6,15), control = list(fnscale = -1),  squaredloss1, method = "L-BFGS-B", hessian = TRUE)
+aaa
+
+# sigma1 <- 0.75, simga2 <- 1.3
+
+
+squaredloss2 <- function(pm){
+  c1 <- pm[1]
+  c2 <- pm[2]
+  c3 <- pm[3]
+  sigma1 <- pm[4]
+  sigma2 <- pm[5]
+  mu1 <- pm[6]
+  mu2 <- pm[7]
+  lambda <- rep(sapply(seq(6.25, 24, 0.25), function(t){
+    # expression for lambda t
+     c1*exp(-0.5*(t-mu1)^2/sigma1^2) +  c2*exp(-0.5*(t-mu2)^2/sigma2^2) + c3 }),17)
+  return(sum(dpois(x2,lambda,log=TRUE)))
+}
+
+bbb <- optim(par = c(60,35,10,0.8,1,9,18), upper = c(100,60,30,3,3,12,21), lower = c(5,5,0.1,0.1,0.1,6,15), control = list(fnscale = -1),  squaredloss2, method = "L-BFGS-B", hessian = TRUE)
+bbb
+
+# sigma1 <- 0.88, simga2 <- 0.96
+```
+
+
+
+
+
+```{r}
+
+# fix the sigma for lambda1
+sigma1_1 = 0.786556
+sigma2_1 = 1.152964
+  
+# fix the sigma for lambda2
+sigma1_2 = 0.8780579
+sigma2_2 = 1.0698788
+  
+x <- rbind(x1, x2)
+
+# This is the cumulative function for lambda(t)
+cmf_lambda <- function(t, c1, c2, sigma1, sigma2, c3, mu1, mu2){
+  
+  c1*sqrt(2*pi*sigma1^2)*pnorm(t, mean = mu1, sd = sigma1) +
+     c2*sqrt(2*pi*sigma2^2)*pnorm(t, mean = mu2, sd = sigma2) + c3*t
+}
+
+
+# This computes the integral of lambda in (t1,t2)
+generate_lambda <- function(t1, c1, c2, sigma1, sigma2, c3, mu1, mu2, length_int){
+  # t1 is the end point
+  # length_int is the length of the interval
+  
+  cmf_lambda(t1, c1, c2, sigma1, sigma2, c3, mu1, mu2) - cmf_lambda(t1-length_int, c1, c2, sigma1, sigma2, c3, mu1, mu2)
+}
+
+
+```
+
+
+
+
+```{r}
+# Cases we do not know the the parameters
+
+# We use MCMC
+# Initialize
+niter = 5000
+
+
+# length of the Markov Chain
+n = dim(x)[2]
+n_dim = dim(x)[1]
+
+# number of states
+states_com <- matrix(data = NA, nrow = prod(states), ncol = n_dim)
+
+for (i in 1:prod(states)){
+  ii = i
+  for (j in 1:n_dim){
+    states_com[i,j] = ceiling(ii/prod(states[-(1:j)]))
+    ii = ifelse(ii%%prod(states[-(1:j)])==0, prod(states[-(1:j)]), ii%%prod(states[-(1:j)]))
+  }
+}
+
+# time
+length_int = 0.25
+t1 <- seq(6.25,24,by = length_int)
+
+
+
+# initialize the store list
+post_z_store1 = list()
+eta_store1 = list()
+
+
+z_sample_store1 = list()
+c_sample_store1 = matrix(data = NA, ncol = niter, nrow = 2)
+
+mu_sample_store1 = list(matrix(data = NA, ncol = niter, nrow = 2), matrix(data = NA, ncol = niter, nrow = 2))
+
+# c1, c2
+c_norm_sample_store1 = list(matrix(data = NA, ncol = niter, nrow = 2), matrix(data = NA, ncol = niter, nrow = 2))
+# c3
+c3_sample_store1 = list(rep(NA, niter), rep(NA, niter))
+
+# log posterior prob
+log_posterior_store1 = rep(NA, niter)
+
+
+# set the initial value of the parameters
+mu.cur = list(c(9,18), c(9,18))
+sigma.cur = list(c(sigma1_1,sigma2_1), c(sigma1_2,sigma2_2)) 
+c_norm.cur = list(c(200,200), c(200,200))
+c3.cur = list(30,30)
+
+# set the first value of c
+c.cur = runif(2, min = 10, max = 40)
+  
+# initial prior for beta 
+# prior for the beta vector beta \sim N(b,B)
+
+# bernoulli variable, ni = 1, we have 3 predictors plus one intercept p = 4
+ni <- 1
+p <- 4
+  
+
+B1 = diag(10, p)
+b1 = rep(0,p)
+B2 = diag(10, p)
+b2 = rep(0,p)
+beta1 <- mvrnorm(mu = b1, Sigma = B1)
+beta1_store <- matrix(data = NA, nrow = niter, ncol = p)
+
+beta2 <- mvrnorm(mu = b2, Sigma = B2)
+beta2_store <- matrix(data = NA, nrow = niter, ncol = p)
+
+eta.cur <- beta_to_eta(rbind(beta1, beta2))
+
+
+# for iFB, we need a initial value for z_sample
+z_sample <- matrix(data = sample(1:2, 2*num_periods*72, replace = TRUE), nrow = 2)
+
+
+```
+
+
+
+```{r}
+
+# MCMC 
+# 1. sample z given initial transition matrix
+#    use fb algorithm
+
+
+# 2. sample transition matrix Mz|z
+#    count the number of transitions and use dirichlet distribution
+#    sample lambda|z
+#    use conjugate gamma distribution
+
+start_time = Sys.time()
+
+for (n_iter in 1:niter){
+  
+  lambda.cur <- sapply(1:n_dim, function(nd){
+    generate_lambda(t1, c_norm.cur[[nd]][1], c_norm.cur[[nd]][2], sigma.cur[[nd]][1], sigma.cur[[nd]][2], c3.cur[[nd]], mu.cur[[nd]][1], mu.cur[[nd]][2], length_int)
+  }, simplify = FALSE)
+
+  # perform FB algorithm
+  for (chaini in 1:2){
+    result = iFBalgorithm(1:2, chaini, x[chaini,], z_sample[-chaini,], px_given_z, lambda.cur[[chaini]], eta.cur, c.cur[chaini], length_int)
+    alpha = result[[1]]
+    beta = result[[2]]
+    post_z = result[[3]]
+    
+    post_z_store1 <- c(post_z_store1, list(post_z))
+
+    # sample a chain
+    z_sample[chaini,] = sample_z(1:2, chaini, x[chaini,], z_sample[-chaini,], alpha, beta, post_z, px_given_z, lambda.cur[[chaini]], eta.cur, c.cur[chaini], length_int)
+  }
+
+  # store the chain
+  z_sample_store1[[n_iter]] = z_sample
+  
+  ## find the beta and eta by polya gamma
+  
+  # define X (we add another column for intercept)
+  X1 <- cbind(rep(1,n-1),t(z_sample[,-dim(z_sample)[2]])-1)
+  
+  # add the interaction term 
+  X2 <- X1[,2]*X1[,3]
+  X <- cbind(X1,X2)
+  
+  # we deal with Y column by column
+  Y1 <- z_sample[1,-1]-1
+  Y2 <- z_sample[2,-1]-1
+
+  
+  # draw omega for dim 1
+  omega1 <- pgdraw(ni, X%*%beta1)
+  
+  # draw beta for dim 1
+  V.omega1 <- solve(t(X) %*% diag(omega1) %*% X + solve(B1))
+  m.omega1 <- V.omega1 %*% (t(X) %*% (Y1-ni/2) + solve(B1) %*% b1)
+  beta1 <- mvrnorm(mu = m.omega1, Sigma = V.omega1)
+  beta1_store[n_iter, ] <- beta1
+  
+  # draw omega for dim 2
+  omega2 <- pgdraw(ni, X%*%beta2)
+  
+  # draw beta for dim 2 
+  V.omega2 <- solve(t(X) %*% diag(omega2) %*% X + solve(B2))
+  m.omega2 <- V.omega2 %*% (t(X) %*% (Y2-ni/2) + solve(B2) %*% b2)
+  beta2 <- mvrnorm(mu = m.omega2, Sigma = V.omega2)
+  beta2_store[n_iter, ] <- beta2
+  
+  # store eta
+  eta.cur <- beta_to_eta(rbind(beta1, beta2))
+  eta_store1 = c(eta_store1, list(eta.cur))
+  
+  
+  
+  # add here
+  for (nd in 1:n_dim){
+    
+    # independence sampling for c
+    
+    # this computes the log full conditional
+    log_full_conditional <- function(c){
+      # store log
+      k2 = which(z_sample[nd,] == 2)
+      lambda_1 <- rep(lambda.cur[[nd]],num_periods)
+      lambda_1[k2] <- lambda_1[k2]+c*length_int
+    
+      return(sum(dpois(x[nd,],  lambda_1, log = TRUE)))
+    }
+    
+    
+    if (n_iter ==1){
+      # the initial condition
+      c_sample_store1[,n_iter] <- c.cur
+      
+    }else{
+      # find the mean (from the mode) and the standard deviation (from the Hessian)
+      #mean_var <- optim(par = 20, lower = 5, upper = 100, log_full_conditional, control = list(fnscale = -1), method = 'Brent', hessian = TRUE)
+      
+      #mean1 <- mean_var$par
+      #sd1 <- sqrt(-solve(mean_var$hessian))
+        
+      
+      # set the variance and the mean as previous found
+      c.can <- rnorm(1, mean = c.cur[nd], sd = 1)
+      log_full_conditional.can <- log_full_conditional(c.can)
+      
+      log_full_conditional.cur <- log_full_conditional(c.cur[nd])
+      
+      
+      # compute the ratio alpha
+      # alpha = logpi(c*) - logpi(c_n-1) + log(q(c_n-1)) - log(q(c*))
+      alpha1 = log_full_conditional.can - log_full_conditional.cur
+      #alpha1 = log_full_conditional.can - log_full_conditional.cur 
+      #+ log(dnorm(c.cur, mean = mean1, sd = sd1)) - log(dnorm(c.can, mean = mean1, sd = sd1))
+  
+      # draw uniform
+      u <- log(runif(1, min = 0, max = 1))
+    
+      if (alpha1 > u){
+        # accept the new candidate
+        c.cur[nd] <- c.can
+      }
+      
+      if (nd == n_dim){
+        # store the value of c
+        c_sample_store1[,n_iter] <- c.cur
+      }
+      
+    }
+  
+    
+    # 1. random walk MH for mu
+    
+    # full conditional of mu
+    log_full_conditional_mu <- function(mu){
+      
+      mu_1 <- mu[1]
+      mu_2 <- mu[2]
+        
+      # compute lambda
+      lambda_t = generate_lambda(t1,  c_norm.cur[[nd]][1], c_norm.cur[[nd]][2], sigma.cur[[nd]][1], sigma.cur[[nd]][2], c3.cur[[nd]], mu_1, mu_2, length_int)
+      
+      lambda_t_full = rep(lambda_t, num_periods)
+        
+      lambda_t1 = lambda_t_full + c.cur*length_int*(z_sample[nd,]-1)
+      
+      
+      # compute the full conditional
+      full_conditional.mu <- -sum(lambda_t1)+sum(x[nd,]*log(lambda_t1))
+  
+      return(full_conditional.mu)
+    }
+  
+  
+    if (n_iter ==1){
+      
+      # the initial condition
+      mu_sample_store1[[nd]][ ,n_iter] <- mu.cur[[nd]]
+      
+    }else{
+      # find the maximum
+      #log_mu_1_mu_2 <- optim(par = c(9, 18), upper = c(12,20), lower = c(6,15),  log_full_conditional_mu, control = list(fnscale = -1), method = "L-BFGS-B", hessian = TRUE)
+    
+    
+      mvn_mu <- mu.cur[[nd]]
+      mvn_sigma <- matrix(data = c(2*10^-4,0,0,2*10^-4), nrow =2)
+
+      #mvn_sigma <- -solve(log_mu_1_mu_2$hessian)
+    
+      # draw new candidate mu
+      mu.can <- mvrnorm(1, mu = mvn_mu, Sigma = mvn_sigma)
+    
+      fc.mu.can <- log_full_conditional_mu(mu.can)
+      fc.mu.cur <- log_full_conditional_mu(mu.cur[[nd]])
+      
+      # compute ratio alpha
+      alpha.mu <- fc.mu.can - fc.mu.cur
+      
+      # draw uniform
+      u.mu <- log(runif(1, min = 0, max = 1))
+      
+      if (u.mu < alpha.mu) {
+        # accept the candidate
+        mu.cur[[nd]] <- mu.can
+    
+      }
+      
+      # store the result
+     mu_sample_store1[[nd]][ ,n_iter] <- mu.cur[[nd]]
+      
+    }
+  
+    
+    
+    # 2. random walk MH for c3 (constant flow)
+    
+    # full conditional of c3 
+    log_full_conditional_c3<- function(c3){
+  
+        
+      # compute lambda
+      lambda_t = generate_lambda(t1,  c_norm.cur[[nd]][1], c_norm.cur[[nd]][2], sigma.cur[[nd]][1], sigma.cur[[nd]][2], c3, mu.cur[[nd]][1], mu.cur[[nd]][2], length_int)
+      
+      lambda_t_full = rep(lambda_t, num_periods)
+        
+      lambda_t1 = lambda_t_full + c.cur*length_int*(z_sample[nd,]-1)
+        
+      # compute the full conditional
+      full_conditional.c3 <- -sum(lambda_t1)+sum(x[nd,]*log(lambda_t1))
+      #full_conditional.c3 <- sum(dpois(x[nd,], lambda_t1, log = TRUE))
+  
+      return(full_conditional.c3)
+    }
+  
+  
+    if (n_iter ==1){
+      
+      # the initial condition
+      c3_sample_store1[[nd]][n_iter] <- c3.cur[[nd]]
+      
+    }else{
+      # find the maximum
+      # log_c_norm <- optim(par = 10, upper = 30, lower = 0,  log_full_conditional_c3, control = list(fnscale = -1), method = "L-BFGS-B", hessian = TRUE)
+    
+      # draw new candidate mu
+      c3.can <- rnorm(1, mean = c3.cur[[nd]], sd = 1)
+    
+      fc.c3.can <- log_full_conditional_c3(c3.can)
+      fc.c3.cur <- log_full_conditional_c3(c3.cur[[nd]])
+      
+      # compute ratio alpha
+      alpha.c3 <- fc.c3.can - fc.c3.cur
+      
+      # draw uniform
+      u.c3 <- log(runif(1, min = 0, max = 1))
+      
+      if (u.c3 < alpha.c3) {
+        # accept the candidate
+        c3.cur[[nd]] <- c3.can
+    
+      }
+      
+      # store the result
+     c3_sample_store1[[nd]][n_iter] <- c3.cur[[nd]]
+      
+    }
+    
+    
+    
+    # 3. random walk MH for c_norm
+    
+    # full conditional of c_norm
+    log_full_conditional_c_norm<- function(c_norm){
+      
+      c_norm_1 <- c_norm[1]
+      c_norm_2 <- c_norm[2]
+      
+      # compute lambda
+      lambda_t = generate_lambda(t1,  c_norm_1, c_norm_2, sigma.cur[[nd]][1], sigma.cur[[nd]][2], c3.cur[[nd]], mu.cur[[nd]][1], mu.cur[[nd]][2], length_int)
+      
+      
+      lambda_t_full = rep(lambda_t, num_periods)
+        
+      lambda_t1 = lambda_t_full + c.cur*length_int*(z_sample[nd,]-1)
+        
+      # compute the full conditional
+      full_conditional.c_norm <- -sum(lambda_t1)+sum(x[nd,]*log(lambda_t1))
+  
+      return(full_conditional.c_norm)
+    }
+  
+  
+    if (n_iter ==1){
+      
+      # the initial condition
+      c_norm_sample_store1[[nd]][ ,n_iter] <- c_norm.cur[[nd]]
+      
+    }else{
+      # find the maximum
+      #log_c_norm <- optim(par = c(60,40), upper = c(100,100), lower = c(40,30),  log_full_conditional_c_norm, control = list(fnscale = -1), method = "L-BFGS-B", hessian = TRUE)
+    
+    
+      mvn_mu <- c_norm.cur[[nd]]
+      #mvn_sigma <- -solve(log_c_norm$hessian)
+    
+      # draw new candidate mu
+      c_norm.can <- mvrnorm(1, mu = mvn_mu, Sigma = matrix(data = c(10,0,0,10),nrow = 2))
+    
+      fc.c_norm.can <- log_full_conditional_c_norm(c_norm.can)
+      fc.c_norm.cur <- log_full_conditional_c_norm(c_norm.cur[[nd]])
+      
+      # compute ratio alpha
+      alpha.c_norm <- fc.c_norm.can - fc.c_norm.cur
+      
+      # draw uniform
+      u.c_norm <- log(runif(1, min = 0, max = 1))
+      
+      if (u.c_norm < alpha.c_norm) {
+        # accept the candidate
+        c_norm.cur[[nd]] <- c_norm.can
+    
+      }
+      
+      # store the result
+     c_norm_sample_store1[[nd]][ ,n_iter] <- c_norm.cur[[nd]]
+      
+    }
+  
+  }
+  
+
+  # compute lambda by mu.cur
+  lambda.cur <- sapply(1:n_dim, function(nd){
+    generate_lambda(t1, c_norm.cur[[nd]][1], c_norm.cur[[nd]][2], sigma.cur[[nd]][1], sigma.cur[[nd]][2], c3.cur[[nd]], mu.cur[[nd]][1], mu.cur[[nd]][2], length_int)
+  }, simplify = FALSE)
+  
+  
+  
+  # compute the log posterior prob pi(x|...)
+  log_posterior_store1[n_iter] <- log_prob(z_sample, x, px_given_z, lambda.cur, eta.cur, states_com, c.cur, length_int)
+  
+  
+}
+
+
+end_time = Sys.time()
+
+name = ''
+setwd('/Users/apple/Desktop/phd/new set up real tweets/uncorrelated')
+
+# write the result
+saveRDS(eta_store1, file=paste('eta_store',name,'.RData', sep = ''))
+saveRDS(z_sample_store1 , file = paste('z_sample_store',name,'.RData', sep = ''))
+saveRDS(c_sample_store1 , file = paste('c_sample_store',name,'.RData', sep = ''))
+saveRDS(c3_sample_store1 , file =  paste('c3_sample_store',name,'.RData', sep = ''))
+saveRDS(c_norm_sample_store1 , file =  paste('c_norm_sample_store',name,'.RData', sep = ''))
+saveRDS(mu_sample_store1 , file = paste('mu_sample_store',name,'.RData', sep = ''))
+saveRDS(log_posterior_store1 , file = paste('log_posterior_store',name,'.RData', sep = ''))
+saveRDS(post_z_store1, file = paste('post_z_store',name,'.Rdata', sep = ''))
+saveRDS(eta_store1, file = paste('eta',name,'.Rdata', sep = ''))
+saveRDS(beta1_store, file = paste('beta1',name,'.Rdata', sep = ''))
+saveRDS(beta2_store, file = paste('beta2',name,'.Rdata', sep = ''))
+```
+
+
+```{r}
+end_time-start_time
+```
+
+
+
+```{r}
+setwd('/Users/apple/Desktop/phd/new set up real tweets/uncorrelated')
+
+# read the result
+
+beta1_store <- readRDS(file='beta1.RData')
+beta2_store <- readRDS(file='beta2.RData')
+eta_store1 <- readRDS(file='eta.RData')
+z_sample_store1 <- readRDS(file = 'z_sample_store.RData')
+c_sample_store1 <- readRDS(file = 'c_sample_store.RData')
+c3_sample_store1 <- readRDS(file = 'c3_sample_store.RData')
+c_norm_sample_store1 <- readRDS(file = 'c_norm_sample_store.RData')
+mu_sample_store1 <- readRDS(file = 'mu_sample_store.RData')
+log_posterior_store1 <- readRDS(file = 'log_posterior_store.RData')
+post_z_store <- readRDS(file = 'post_z_store.Rdata')
+
+
+```
+
+
+```{r}
+# 1. check the log posterior density
+plot(1:niter, log_posterior_store1, ylab = 'log posterior probability', xlab = 'iteration', type = 'l')
+
+```
+
+
+```{r}
+
+# 2. check the transition matrix
+
+# find the mean of the transition matrix
+eta_mean = matrix(data = 0, nrow = prod(states), ncol = sum(states))
+
+# burn in the first 1500 terms in markov chain
+nburn = 1500
+
+for (i in (nburn+1):niter){
+  eta_mean = eta_mean + eta_store1[[i]]
+}
+
+# print predicted transition matrix
+eta_predicted = eta_mean/(niter-nburn) 
+print(eta_predicted)
+
+# print eta (real transition matrix)
+#print(eta)
+
+```
+
+```{r}
+# check eta(i,j)
+rowi = 1
+colj = 1
+
+eta11 <- rep(NA, niter)
+for (i in 1:niter){
+  eta11[i] = eta_store1[[i]][rowi,colj]
+}
+
+# trace plot
+plot(1:niter, eta11[1:niter], type = 'l')
+
+# histogram
+hist(eta11[(nburn+1):niter], freq = 10)
+
+boxplot(eta11[(nburn+1):niter])
+```
+
+
+```{r}
+plot(beta1_store[,1],type = 'l', ylim = c(-5,10), col = 1)
+lines(beta1_store[,2], col = 'red')
+lines(beta1_store[,3], col = 'blue')
+lines(beta1_store[,4], col = 'purple')
+
+mean(beta1_store[500:5000,2])/sd(beta1_store[500:5000,2])
+mean(beta1_store[500:5000,3])/sd(beta1_store[500:5000,3])
+mean(beta1_store[500:5000,4])/sd(beta1_store[500:5000,4])
+```
+
+
+```{r}
+plot(beta2_store[,1],type = 'l', ylim = c(-5,10), col = 1)
+lines(beta2_store[,2], col = 'red')
+lines(beta2_store[,3], col = 'blue')
+lines(beta2_store[,4], col = 'purple')
+
+mean(beta2_store[500:5000,2])/sd(beta2_store[500:5000,2])
+mean(beta2_store[500:5000,3])/sd(beta2_store[500:5000,3])
+mean(beta2_store[500:5000,4])/sd(beta2_store[500:5000,4])
+```
+
+
+```{r}
+# check the shifting constant 
+
+# dim 1
+# trace plot
+plot(1:niter,c_sample_store1[1,], type = 'l', lwd = 1, ylab = 'c (dim 1)', xlab = 'iteration', main = 'trace plot of c in dim 1')
+
+
+# density
+hist(c_sample_store1[1,(nburn+1):niter], xlab = 'c (dim 1)')
+
+#value
+print(mean(c_sample_store1[1,(nburn+1):niter]))
+
+# dim 2
+# trace plot
+plot(1:niter,c_sample_store1[2,], type = 'l', lwd = 1, ylab = 'c (dim 2)', xlab = 'iteration', main = 'trace plot of c in dim 2')
+
+# density
+hist(c_sample_store1[2,(nburn+1):niter], xlab = 'c (dim 2)')
+
+#value
+print(mean(c_sample_store1[2,(nburn+1):niter]))
+
+
+c_hat = rowMeans(c_sample_store1[,(nburn+1):niter])
+```
+
+
+
+```{r}
+# check mu
+
+# dim 1
+# trace plot
+plot(1:niter, mu_sample_store1[[1]][1,], type = 'l', lwd = 1, ylab = 'mu1 (dim 1)', xlab = 'iteration', main = 'trace plot of mu1 in dim 1')
+
+# density
+hist(mu_sample_store1[[1]][1,(nburn+1):niter], breaks = 20, main = 'histogram of mu1 in dim 1', xlab = 'mu1 (dim 1)')
+
+# value
+mu1_1_hat = mean(mu_sample_store1[[1]][1,(nburn+1):niter])
+print(mu1_1_hat)
+
+# trace plot
+plot(1:niter, mu_sample_store1[[1]][2,], type = 'l', lwd = 1, ylab = 'mu2 (dim 1)', xlab = 'iteration', main = 'trace plot of mu2 in dim 1')
+
+# density
+hist(mu_sample_store1[[1]][2,(nburn+1):niter], breaks = 20, main = 'histogram of mu2 in dim 1', xlab = 'mu2 (dim 1)')
+
+# value
+mu2_1_hat = mean(mu_sample_store1[[1]][2,(nburn+1):niter])
+print(mu2_1_hat)
+
+
+# dim 2
+# trace plot
+plot(1:niter, mu_sample_store1[[2]][1,], type = 'l', lwd = 1, ylab = 'mu1 (dim 2)', xlab = 'iteration', main = 'trace plot of mu1 in dim 2')
+
+# density
+hist(mu_sample_store1[[2]][1,(nburn+1):niter], breaks = 20, main = 'histogram of mu1 in dim 2', xlab = 'mu1 (dim 2)')
+
+# value
+mu1_2_hat = mean(mu_sample_store1[[2]][1,(nburn+1):niter])
+print(mu1_2_hat)
+
+# trace plot
+plot(1:niter, mu_sample_store1[[2]][2,], type = 'l', lwd = 1, ylab = 'mu2 (dim 2)', xlab = 'iteration', main = 'trace plot of mu2 in dim 2')
+
+# density
+hist(mu_sample_store1[[2]][2,(nburn+1):niter], breaks = 20, main = 'histogram of mu2 in dim 2', xlab = 'mu2 (dim 2)')
+
+# value
+mu2_2_hat = mean(mu_sample_store1[[2]][2,(nburn+1):niter])
+print(mu2_2_hat)
+
+``` 
+
+
+```{r}
+# check c1 and c2
+
+# dim 1
+# trace plot
+plot(1:niter, c_norm_sample_store1[[1]][1,], type = 'l', lwd = 1, ylab = 'c1 (dim 1)', xlab = 'iteration', main = 'trace plot of c1 in dim 1')
+
+# density
+hist(c_norm_sample_store1[[1]][1,(nburn+1):niter], breaks = 20, main = 'histogram of c1 in dim 1', xlab = 'c1 (dim 1)')
+
+# value
+c1_1_hat = mean(c_norm_sample_store1[[1]][1,(nburn+1):niter])
+print(c1_1_hat)
+
+# trace plot
+plot(1:niter, c_norm_sample_store1[[1]][2,], type = 'l', lwd = 1, ylab = 'c2 (dim 1)', xlab = 'iteration', main = 'trace plot of c2 in dim 1')
+
+# density
+hist(c_norm_sample_store1[[1]][2,(nburn+1):niter], breaks = 20, main = 'histogram of c2 in dim 1', xlab = 'c2 (dim 1)')
+
+# value
+c2_1_hat = mean(c_norm_sample_store1[[1]][2,(nburn+1):niter])
+print(c2_1_hat)
+
+
+# dim 2
+# trace plot
+plot(1:niter, c_norm_sample_store1[[2]][1,], type = 'l', lwd = 1, ylab = 'c1 (dim 2)', xlab = 'iteration', main = 'trace plot of c1 in dim 2')
+
+# density
+hist(c_norm_sample_store1[[2]][1,(nburn+1):niter], breaks = 20, main = 'histogram of c1 in dim 2', xlab = 'c1 (dim 2)')
+
+# value
+c1_2_hat = mean(c_norm_sample_store1[[2]][1,(nburn+1):niter])
+print(c1_2_hat)
+
+# trace plot
+plot(1:niter, c_norm_sample_store1[[2]][2,], type = 'l', lwd = 1, ylab = 'c2 (dim 2)', xlab = 'iteration', main = 'trace plot of c2 in dim 2')
+
+# density
+hist(c_norm_sample_store1[[2]][2,(nburn+1):niter], breaks = 20, main = 'histogram of c2 in dim 2', xlab = 'c2 (dim 2)')
+
+# value
+c2_2_hat = mean(c_norm_sample_store1[[2]][2,(nburn+1):niter])
+print(c2_2_hat)
+
+```
+
+```{r}
+# check c3
+
+# dim 1
+# trace plot
+plot(1:niter,c3_sample_store1[[1]], type = 'l', lwd = 1, ylab = 'c3 (dim 1)', xlab = 'iteration', main = 'trace plot of c3 in dim 1')
+
+# density
+hist(c3_sample_store1[[1]][(nburn+1):niter], xlab = 'c3 (dim 1)')
+
+#value
+c3_1_hat = mean(c3_sample_store1[[1]][(nburn+1):niter])
+print(c3_1_hat)
+
+# dim 2
+# trace plot
+plot(1:niter,c3_sample_store1[[2]], type = 'l', lwd = 1, ylab = 'c3 (dim 2)', xlab = 'iteration', main = 'trace plot of c3 in dim 2')
+
+# density
+hist(c3_sample_store1[[2]][(nburn+1):niter], xlab = 'c3 (dim 2)')
+
+#value
+c3_2_hat = mean(c3_sample_store1[[2]][(nburn+1):niter])
+print(c3_2_hat)
+
+
+```
+
+
+
+```{r}
+# check the overall lambda
+
+# lambda in dim 1
+lambda1_hat = generate_lambda(seq(6.25, 24, 0.25), c1_1_hat, c2_1_hat, sigma1_1, sigma2_1, c3_1_hat, mu1_1_hat, mu2_1_hat, length_int)
+
+plot(seq(6.25, 24, 0.25), lambda1_hat, col = 2, lwd = 2, type = 'l', ylab = 'lambda', xlab = 't (hour)', main = 'Lambda in dim 1', ylim = c(0,120))
+
+
+
+# lambda in dim 2
+lambda2_hat = generate_lambda(seq(6.25, 24, 0.25), c1_2_hat, c2_2_hat, sigma1_2, sigma2_2, c3_2_hat, mu1_2_hat, mu2_2_hat, length_int)
+
+lines(seq(6.25, 24, 0.25), lambda2_hat, col = 3, lwd = 2, type = 'l', ylab = 'lambda', xlab = 't (hour)', main = 'Lambda in dim 2', ylim = c(0,180))
+
+
+lambda_hat <- list(lambda1_hat, lambda2_hat)
+```
+
+
+
+
+
+
+```{r}
+eta1 = 0.9
+eta2 = 0.3
+eta3 = 0.7
+eta4 = 0.25
+
+ttjjll <- function(x){
+  theta11 <- x[1]
+  theta21 <- x[2]
+  a <- x[3]
+  b <- x[4]
+  c <- x[5]
+  d <- x[6]
+  eta11 <- theta11*a + theta21*b
+  eta21 <- theta11*a + theta21*b
+  eta31 <- theta11*a + theta21*b
+  eta41 <- theta11*a + theta21*b
+  eta_target <- c(eta11, eta21, eta31, eta41)
+  
+  sq_diff1 <- (eta_target-c(eta1,eta2,eta3,eta4))^2
+  return(sum(sq_diff1))
+}
+
+
+optim(par = c(0,0,0,0,0,0),  ttjjll,  method = "Nelder-Mead", hessian = TRUE)
+```
+
+
+
+
+
+
+
